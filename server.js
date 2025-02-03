@@ -3,7 +3,12 @@ require('dotenv').config();
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
-const io = require('socket.io')(http);
+const io = require('socket.io')(http, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
 const path = require('path');
 
 // Statik dosyaları serve et
@@ -15,7 +20,7 @@ app.get('/', (req, res) => {
 });
 
 const players = {};
-const bullets = [];
+let bullets = [];
 
 // Engeller dizisini güncelle - daha stratejik bir harita
 const obstacles = [
@@ -160,41 +165,110 @@ const WEAPONS = {
     }
 };
 
+// En üste ekleyin
+const LOBBY_ID = 'main_lobby';
+let activeGames = new Map();
+
+// Oyuncu yönetimi için yardımcı fonksiyonlar
+function respawnPlayer(playerId) {
+    if (!players[playerId]) return;
+    
+    const player = players[playerId];
+    const spawnPoint = getRandomSpawnPoint(player.team);
+    
+    player.health = 100;
+    player.x = spawnPoint.x;
+    player.y = spawnPoint.y;
+    
+    // Yeni pozisyonu tüm oyunculara bildir
+    io.emit('playerRespawned', {
+        id: playerId,
+        x: player.x,
+        y: player.y,
+        health: player.health
+    });
+}
+
+// Ölüm olayını güncelle
+function handlePlayerDeath(targetId, killerId) {
+    if (!players[targetId] || !players[killerId]) return;
+    
+    const killer = players[killerId];
+    const victim = players[targetId];
+    
+    // Skor güncelleme
+    if (killer.team === 'turk') {
+        teamScores.turk++;
+    } else {
+        teamScores.kurt++;
+    }
+    
+    killer.score += 10;
+    
+    // Öldürme bilgisini gönder
+    io.emit('playerKilled', {
+        killerId: killerId,
+        victimId: targetId,
+        killerTeam: killer.team,
+        killerScore: killer.score,
+        teamScores: teamScores
+    });
+    
+    // 3 saniye sonra yeniden doğur
+    setTimeout(() => respawnPlayer(targetId), 3000);
+}
+
+// Socket bağlantı yönetimini güncelleyelim
 io.on('connection', (socket) => {
     console.log('Oyuncu bağlandı:', socket.id);
     
+    // Oyuncuyu ana lobiye ekle
+    socket.join(LOBBY_ID);
+    
     socket.on('playerJoined', (playerData) => {
-        // Yeni oyuncu verilerini kaydet
-        players[socket.id] = {
-            id: socket.id,
-            x: playerData.x,
-            y: playerData.y,
-            angle: playerData.angle,
-            health: playerData.health,
-            score: playerData.score,
-            name: playerData.name,
-            team: playerData.team,
-            color: playerData.color
-        };
-        
-        // Yeni oyuncuya tüm mevcut oyuncuları gönder
-        socket.emit('currentPlayers', players);
-        
-        // Diğer oyunculara yeni oyuncuyu bildir
-        socket.broadcast.emit('playerJoined', players[socket.id]);
-        
-        console.log('Oyuncu katıldı:', players[socket.id].name);
-        console.log('Mevcut oyuncular:', Object.keys(players).length);
+        try {
+            // Oyuncu verilerini kaydet
+            players[socket.id] = {
+                ...playerData,
+                id: socket.id,
+                lastUpdate: Date.now(),
+                lobbyId: LOBBY_ID
+            };
+            
+            // Tüm oyun durumunu gönder
+            const gameState = {
+                players: Object.fromEntries(
+                    Object.entries(players).filter(([_, p]) => p.lobbyId === LOBBY_ID)
+                ),
+                teamScores,
+                obstacles
+            };
+            
+            // Önce mevcut oyuncuları gönder
+            socket.emit('gameState', gameState);
+            
+            // Sonra diğer oyunculara yeni oyuncuyu bildir
+            socket.to(LOBBY_ID).emit('playerJoined', players[socket.id]);
+            
+            // Takım dengesi kontrolü
+            balanceTeams();
+            
+            console.log(`Oyuncu ${playerData.name} lobiye katıldı. Toplam: ${Object.keys(players).length}`);
+        } catch (error) {
+            console.error('playerJoined hatası:', error);
+        }
     });
     
+    // Oyuncu hareketi güncellemesi
     socket.on('playerMove', (data) => {
         if (players[socket.id]) {
             players[socket.id] = {
                 ...players[socket.id],
-                ...data
+                ...data,
+                lastUpdate: Date.now()
             };
-            // Tüm oyunculara hareketi bildir
-            socket.broadcast.emit('playerMoved', players[socket.id]);
+            // Sadece aynı lobideki oyunculara bildir
+            socket.to(LOBBY_ID).emit('playerMoved', players[socket.id]);
         }
     });
     
@@ -226,11 +300,14 @@ io.on('connection', (socket) => {
         }
     });
     
+    // Bağlantı koptuğunda
     socket.on('disconnect', () => {
         if (players[socket.id]) {
             console.log('Oyuncu ayrıldı:', players[socket.id].name);
+            // Sadece aynı lobidekilere bildir
+            socket.to(LOBBY_ID).emit('playerLeft', socket.id);
             delete players[socket.id];
-            io.emit('playerLeft', socket.id);
+            balanceTeams();
         }
     });
 
@@ -292,6 +369,21 @@ io.on('connection', (socket) => {
     });
 });
 
+// Takım dengeleme fonksiyonu
+function balanceTeams() {
+    const lobbyPlayers = Object.values(players).filter(p => p.lobbyId === LOBBY_ID);
+    const turkTeam = lobbyPlayers.filter(p => p.team === 'turk');
+    const kurtTeam = lobbyPlayers.filter(p => p.team === 'kurt');
+    
+    // Takımlar arasında 2'den fazla fark varsa
+    if (Math.abs(turkTeam.length - kurtTeam.length) > 2) {
+        io.to(LOBBY_ID).emit('teamBalance', {
+            turkCount: turkTeam.length,
+            kurtCount: kurtTeam.length
+        });
+    }
+}
+
 // Mermi yaşam süresini ve hareket sistemini güncelle
 const BULLET_LIFETIME = 3000; // 3 saniye
 
@@ -347,49 +439,6 @@ setInterval(() => {
     // Güncel mermi pozisyonlarını gönder
     io.emit('bullets', bullets);
 }, 1000/60);
-
-// Oyuncu ölüm işlemi için yardımcı fonksiyon
-function handlePlayerDeath(targetPlayer, killerId) {
-    const killerTeam = players[killerId].team;
-    
-    // Takım skorunu güncelle
-    if (killerTeam === 'turk') {
-        teamScores.turk++;
-    } else if (killerTeam === 'kurt') {
-        teamScores.kurt++;
-    }
-    
-    // Skor güncellemelerini gönder
-    io.emit('teamScoreUpdate', teamScores);
-    
-    // Öldüren oyuncuya puan ver
-    if (players[killerId]) {
-        players[killerId].score += 10;
-        io.emit('updateScore', {
-            playerId: killerId,
-            score: players[killerId].score
-        });
-    }
-    
-    // Ölüm bilgisini gönder
-    io.emit('playerDied', {
-        targetId: targetPlayer.id,
-        killerId: killerId
-    });
-    
-    // Kill feed mesajı
-    io.emit('killFeed', {
-        killer: players[killerId].name,
-        victim: targetPlayer.name,
-        weapon: bullet.weaponType
-    });
-    
-    // Oyuncuyu yeniden doğur
-    targetPlayer.health = 100;
-    const spawnPoint = getRandomSpawnPoint(targetPlayer.team);
-    targetPlayer.x = spawnPoint.x;
-    targetPlayer.y = spawnPoint.y;
-}
 
 // Power-up oluşturma fonksiyonunu güncelle
 setInterval(() => {
@@ -520,7 +569,7 @@ setInterval(() => {
                 
                 // Öldürme kontrolü
                 if (targetPlayer.health <= 0) {
-                    handlePlayerDeath(targetPlayer, bullet.playerId);
+                    handlePlayerDeath(targetPlayer.id, bullet.playerId);
                 }
                 
                 bulletsToRemove.push(index);
@@ -540,6 +589,49 @@ setInterval(() => {
 
     io.emit('bullets', bullets);
 }, 1000/60);
+
+// Düzenli temizlik ve senkronizasyon
+setInterval(() => {
+    const now = Date.now();
+    
+    // Hayalet oyuncuları temizle
+    Object.keys(players).forEach(id => {
+        if (now - players[id].lastUpdate > 10000) {
+            io.to(LOBBY_ID).emit('playerLeft', id);
+            delete players[id];
+        }
+    });
+    
+    // Eski mermileri temizle - burada hata oluşuyordu
+    // bullets = bullets.filter(...) yerine splice kullanın
+    const oldBullets = bullets.filter(bullet => now - bullet.createdAt >= 3000);
+    oldBullets.forEach(bullet => {
+        const index = bullets.indexOf(bullet);
+        if (index > -1) {
+            bullets.splice(index, 1);
+        }
+    });
+    
+    // Oyun durumunu senkronize et
+    const gameState = {
+        players: Object.fromEntries(
+            Object.entries(players).filter(([_, p]) => p.lobbyId === LOBBY_ID)
+        ),
+        teamScores,
+        obstacles
+    };
+    
+    io.to(LOBBY_ID).emit('gameState', gameState);
+}, 1000);
+
+// Hata yönetimi
+process.on('uncaughtException', (error) => {
+    console.error('Kritik hata:', error);
+});
+
+io.on('error', (error) => {
+    console.error('Socket.io hatası:', error);
+});
 
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, '0.0.0.0', () => {

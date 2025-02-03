@@ -1,11 +1,15 @@
-// Socket.io bağlantısı
+// Socket.io bağlantısını güncelle
 const socket = io({
     transports: ['websocket'],
     reconnection: true,
     reconnectionDelay: 1000,
     reconnectionDelayMax: 5000,
     reconnectionAttempts: Infinity,
-    path: '/socket.io'
+    path: '/socket.io',
+    secure: true,
+    query: {
+        clientTime: Date.now()
+    }
 });
 
 // Canvas ve context tanımlamaları
@@ -67,9 +71,30 @@ const ABILITIES = {
     }
 };
 
+// Yeniden bağlanma ve durum yönetimi
+let reconnecting = false;
+let gameState = {
+    players: {},
+    teamScores: { turk: 0, kurt: 0 },
+    obstacles: []
+};
+
 // Socket olayları
 socket.on('connect', () => {
     console.log('Sunucuya bağlandı, ID:', socket.id);
+    if (reconnecting && gameStarted) {
+        // Yeniden bağlanma durumunda oyun durumunu geri yükle
+        socket.emit('playerJoined', {
+            name: playerName,
+            team: player.team,
+            x: player.x,
+            y: player.y,
+            angle: player.angle,
+            health: player.health,
+            score: player.score
+        });
+    }
+    reconnecting = false;
 });
 
 socket.on('connect_error', (error) => {
@@ -984,4 +1009,127 @@ function useAbility() {
             type: ability.name
         });
     }
-} 
+}
+
+// Oyuncu öldüğünde
+socket.on('playerKilled', (data) => {
+    if (data.victimId === socket.id) {
+        player.health = 0;
+        showDeathScreen();
+    }
+    
+    updateTeamScores(data.teamScores);
+    updateKillFeed(data);
+});
+
+// Yeniden doğma
+socket.on('playerRespawned', (data) => {
+    if (data.id === socket.id) {
+        player.x = data.x;
+        player.y = data.y;
+        player.health = data.health;
+        hideDeathScreen();
+    } else if (players[data.id]) {
+        players[data.id].x = data.x;
+        players[data.id].y = data.y;
+        players[data.id].health = data.health;
+    }
+});
+
+// Ölüm ekranı
+function showDeathScreen() {
+    const deathScreen = document.createElement('div');
+    deathScreen.id = 'deathScreen';
+    deathScreen.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(0,0,0,0.8);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        z-index: 1000;
+    `;
+    deathScreen.innerHTML = `
+        <h2>Öldünüz!</h2>
+        <p>3 saniye içinde yeniden doğacaksınız...</p>
+    `;
+    document.body.appendChild(deathScreen);
+}
+
+function hideDeathScreen() {
+    const deathScreen = document.getElementById('deathScreen');
+    if (deathScreen) {
+        deathScreen.remove();
+    }
+}
+
+// Oyun durumu güncellemesi
+socket.on('gameState', (state) => {
+    if (!gameStarted) return;
+    
+    // Sadece diğer oyuncuları güncelle
+    const otherPlayers = {};
+    Object.entries(state.players).forEach(([id, p]) => {
+        if (id !== socket.id) {
+            otherPlayers[id] = p;
+        }
+    });
+    
+    players = otherPlayers;
+    teamScores = state.teamScores;
+    updateTeamScores(state.teamScores);
+});
+
+// Yeniden bağlanma durumu
+socket.on('disconnect', () => {
+    console.log('Sunucu bağlantısı koptu');
+    reconnecting = true;
+    
+    // Bağlantı koptuğunu göster
+    showConnectionLostScreen();
+});
+
+// Bağlantı kopma ekranı
+function showConnectionLostScreen() {
+    const screen = document.createElement('div');
+    screen.id = 'connectionLostScreen';
+    screen.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: rgba(0,0,0,0.9);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        z-index: 1000;
+    `;
+    screen.innerHTML = `
+        <h2>Bağlantı Koptu!</h2>
+        <p>Yeniden bağlanmaya çalışılıyor...</p>
+    `;
+    document.body.appendChild(screen);
+}
+
+// Bağlantı yeniden sağlandığında
+socket.on('connect', () => {
+    const lostScreen = document.getElementById('connectionLostScreen');
+    if (lostScreen) lostScreen.remove();
+    
+    if (reconnecting && gameStarted) {
+        socket.emit('playerJoined', {
+            name: playerName,
+            team: player.team,
+            x: player.x,
+            y: player.y,
+            angle: player.angle,
+            health: player.health,
+            score: player.score
+        });
+    }
+    reconnecting = false;
+}); 
